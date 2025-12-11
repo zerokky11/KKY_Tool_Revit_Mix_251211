@@ -41,7 +41,13 @@ Namespace Infrastructure
         ''' Int64에서 ElementId 생성 (모든 버전 공통)
         ''' </summary>
         Public Function FromLong(id As Long) As ElementId
+#If REVIT2025 Then
+            ' 2024+ : Int64 생성자 사용
             Return New ElementId(id)
+#Else
+            ' 2019~2023: Int32 생성자만 존재
+            Return New ElementId(CInt(id))
+#End If
         End Function
 
     End Module

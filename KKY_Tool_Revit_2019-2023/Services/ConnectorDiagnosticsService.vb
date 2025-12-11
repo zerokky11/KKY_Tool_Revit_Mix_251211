@@ -33,93 +33,105 @@ Namespace Services
             Dim doc = uidoc.Document
             Log($"시작 tolFt={tolFt:0.###}, param='{param}'")
 
-            ' 1) 커넥터 수집
-            Dim items = CollectAllConnectors(doc)
-            Log($"커넥터 수집 완료: total={items.Count}")
+            ' 1) 커넥터 있는 요소 수집 (Command 버전 기준)
+            Dim elems = CollectElementsWithConnectors(doc)
+            Log($"수집 요소: {elems.Count}")
 
-            If items.Count = 0 Then
-                Log("items=0 → 종료")
+            If elems.Count = 0 Then
+                Log("커넥터를 가진 요소가 없습니다.")
                 Return rows
             End If
 
-            ' 2) tol 기반 버킷
-            Dim cell As Double = Math.Max(tolFt, 0.000001)
-            Dim buckets = BuildBuckets(items, cell)
-            Log($"버킷: cell={cell:0.###}ft, bucketCount={buckets.Count}")
+            ' 요소별 커넥터 매핑
+            Dim elemConns As New Dictionary(Of Integer, List(Of Connector))()
+            For Each el In elems
+                elemConns(el.Id.IntegerValue) = GetConnectors(el)
+            Next
 
-            ' 3) 후보 비교
-            Dim tol2 As Double = tolFt * tolFt
-            Dim seen As New HashSet(Of String)(StringComparer.Ordinal)
-            Dim scanned As Long = 0, withinTol As Long = 0
+            ' 모든 커넥터 좌표 버킷 구성 (1ft 셀)
+            Dim allConnPoints As New List(Of Tuple(Of Integer, XYZ, Connector))()
+            For Each kv In elemConns
+                For Each c In kv.Value
+                    allConnPoints.Add(Tuple.Create(kv.Key, c.Origin, c))
+                Next
+            Next
+            Dim buckets = BuildGrid(allConnPoints)
+            Log($"버킷 수: {buckets.Count}")
 
-            For Each it In items
-                Dim neigh = GetNeighborCandidates(buckets, it, cell)
-                For Each jt In neigh
-                    If it.OwnerId = jt.OwnerId Then Continue For
+            ' 후보 비교 (Command 로직)
+            Dim seenPairs As New HashSet(Of String)(StringComparer.Ordinal)
 
-                    Dim aId = Math.Min(it.OwnerId, jt.OwnerId)
-                    Dim bId = Math.Max(it.OwnerId, jt.OwnerId)
-                    Dim key = aId.ToString() & "_" & bId.ToString() & "_" & it.IndexHint & "_" & jt.IndexHint
-                    If seen.Contains(key) Then Continue For
-                    seen.Add(key)
+            For Each el In elems
+                Dim baseId = el.Id.IntegerValue
+                Dim conns = elemConns(baseId)
+                For Each c In conns
+                    Dim found As Element = Nothing
+                    Dim distFt As Double = 0
+                    Dim connType As String = ""
 
-                    scanned += 1
-                    Dim diff As XYZ = it.P - jt.P
-                    Dim d2 As Double = diff.DotProduct(diff)
-                    If d2 > tol2 Then Continue For
-                    withinTol += 1
+                    ' 1) 실제 연결
+                    If c.IsConnected Then
+                        For Each r As Connector In c.AllRefs.Cast(Of Connector)()
+                            If r?.Owner Is Nothing Then Continue For
+                            If r.Owner.Id.IntegerValue = baseId Then Continue For
+                            If TypeOf r.Owner Is MEPSystem Then Continue For
+                            found = r.Owner
+                            connType = "Physical(커넥터 연결 됨)"
+                            Exit For
+                        Next
+                    End If
 
-                    rows.Add(BuildRow(it.Owner, jt.Owner, Math.Sqrt(d2) * 12.0, it.Conn, jt.Conn, param))
+                    ' 2) 근접 후보
+                    If found Is Nothing Then
+                        Dim key = BucketKey(c.Origin)
+                        For dx = -1 To 1
+                            For dy = -1 To 1
+                                For dz = -1 To 1
+                                    Dim nbKey = Tuple.Create(key.Item1 + dx, key.Item2 + dy, key.Item3 + dz)
+                                    If buckets.ContainsKey(nbKey) Then
+                                        For Each nb In buckets(nbKey)
+                                            Dim otherId = nb.Item1
+                                            If otherId = baseId Then Continue For
+
+                                            Dim d = c.Origin.DistanceTo(nb.Item2)
+                                            If d <= tolFt Then
+                                                found = doc.GetElement(New ElementId(otherId))
+                                                distFt = d
+                                                connType = "Proximity(커넥터 연결 필요)"
+                                                Exit For
+                                            End If
+                                        Next
+                                    End If
+                                    If found IsNot Nothing Then Exit For
+                                Next
+                                If found IsNot Nothing Then Exit For
+                            Next
+                            If found IsNot Nothing Then Exit For
+                        Next
+                    End If
+
+                    If String.IsNullOrEmpty(connType) Then connType = "연결 대상 객체 없음"
+
+                    Dim distInch As Double = Math.Round(distFt * 12.0, 2)
+                    Dim v1 = GetParamValue(el, param)
+                    Dim v2 As String = If(found IsNot Nothing, GetParamValue(found, param), "N/A")
+                    Dim status = If(found Is Nothing, "연결 대상 객체 없음", If(v1 = v2, "Match", "Mismatch"))
+
+                    Dim id1Val = baseId
+                    Dim id2Val = If(found IsNot Nothing, found.Id.IntegerValue, 0)
+                    Dim pairKey As String = If(id1Val <= id2Val, $"{id1Val}_{id2Val}", $"{id2Val}_{id1Val}")
+                    If seenPairs.Contains(pairKey) Then Continue For
+                    seenPairs.Add(pairKey)
+
+                    rows.Add(BuildRow(el, found, distInch, connType, param, v1, v2, status))
                 Next
             Next
 
-            Log($"스캔: scanned={scanned}, withinTol={withinTol}, rows={rows.Count}")
-
-            ' 4) 결과 0건일 때 Fallback: 실제 연결만 전수 수집
-            If rows.Count = 0 Then
-                Dim fb As New List(Of Dictionary(Of String, Object))()
-                Dim seenPair As New HashSet(Of String)(StringComparer.Ordinal)
-                Dim tried As Integer = 0
-
-                For Each it In items
-                    tried += 1
-                    Dim c = it.Conn
-                    If c Is Nothing OrElse Not c.IsConnected Then Continue For
-                    Dim refs = c.AllRefs
-                    If refs Is Nothing OrElse refs.Size = 0 Then Continue For
-
-                    For Each ro In refs
-                        Dim rc As Connector = TryCast(ro, Connector)
-                        If rc Is Nothing OrElse rc.Owner Is Nothing Then Continue For
-                        If rc.Owner.Id.IntegerValue = it.OwnerId Then Continue For
-
-                        Dim aId = Math.Min(it.OwnerId, rc.Owner.Id.IntegerValue)
-                        Dim bId = Math.Max(it.OwnerId, rc.Owner.Id.IntegerValue)
-                        Dim key = aId.ToString() & "-" & bId.ToString()
-                        If seenPair.Contains(key) Then Continue For
-                        seenPair.Add(key)
-
-                        Dim distInch As Double = 0.0
-                        Try
-                            If rc.Origin IsNot Nothing AndAlso it.P IsNot Nothing Then
-                                Dim df As XYZ = it.P - rc.Origin
-                                distInch = Math.Sqrt(df.DotProduct(df)) * 12.0
-                            End If
-                        Catch
-                        End Try
-
-                        fb.Add(BuildRow(it.Owner, rc.Owner, distInch, it.Conn, rc, param, True))
-                    Next
-                Next
-
-                Log($"fallback connected: tried={tried}, pairs={fb.Count}")
-                If fb.Count > 0 Then rows = fb
-            End If
-
-            ' 5) 정렬
+            ' 정렬 및 샘플 로그
             rows = rows.OrderBy(Function(r) ToDouble(r("Distance (inch)"))) _
                        .ThenBy(Function(r) Convert.ToInt32(r("Id1"))) _
-                       .ThenBy(Function(r) Convert.ToInt32(r("Id2"))).ToList()
+                       .ThenBy(Function(r) Convert.ToInt32(r("Id2"))) _
+                       .ToList()
 
             If rows.Count > 0 Then
                 Dim s = rows(0)
@@ -146,32 +158,20 @@ Namespace Services
 
         ' --------- 내부 유틸 ---------
 
-        Private Class ConnItem
-            Public Property Owner As Element
-            Public Property OwnerId As Integer
-            Public Property Conn As Connector
-            Public Property P As XYZ
-            Public Property IndexHint As Integer
-        End Class
-
-        Private Shared Function BuildRow(e1 As Element, e2 As Element, distInch As Double, a As Connector, b As Connector, param As String, Optional forceConnected As Boolean = False) As Dictionary(Of String, Object)
-            Dim cat1 As String = If(e1.Category Is Nothing, "", e1.Category.Name)
-            Dim cat2 As String = If(e2.Category Is Nothing, "", e2.Category.Name)
+        Private Shared Function BuildRow(e1 As Element, e2 As Element, distInch As Double, connType As String, param As String, v1 As String, v2 As String, status As String) As Dictionary(Of String, Object)
+            Dim cat1 As String = If(e1?.Category Is Nothing, "", e1.Category.Name)
+            Dim cat2 As String = If(e2?.Category Is Nothing, "", e2.Category.Name)
             Dim fam1 As String = GetFamilyName(e1)
             Dim fam2 As String = GetFamilyName(e2)
-            Dim connType As String = If(forceConnected OrElse IsConnectedTo(a, b), "Connected", "Near")
-            Dim v1 As String = ReadParamAsString(e1, param)
-            Dim v2 As String = ReadParamAsString(e2, param)
-            Dim status As String = If(String.Equals(v1, v2, StringComparison.OrdinalIgnoreCase), "OK", "Mismatch")
 
             Return New Dictionary(Of String, Object)(StringComparer.Ordinal) From {
-                {"Id1", e1.Id.IntegerValue.ToString()},
-                {"Id2", e2.Id.IntegerValue.ToString()},
+                {"Id1", If(e1 IsNot Nothing, e1.Id.IntegerValue.ToString(), "0")},
+                {"Id2", If(e2 IsNot Nothing, e2.Id.IntegerValue.ToString(), "0")},
                 {"Category1", cat1},
                 {"Category2", cat2},
                 {"Family1", fam1},
                 {"Family2", fam2},
-                {"Distance (inch)", FormatNumber(distInch)},
+                {"Distance (inch)", distInch},
                 {"ConnectionType", connType},
                 {"ParamName", param},
                 {"Value1", v1},
@@ -180,118 +180,70 @@ Namespace Services
             }
         End Function
 
-        Private Shared Function BuildBuckets(items As List(Of ConnItem), cellSizeFt As Double) As Dictionary(Of String, List(Of ConnItem))
-            Dim dict As New Dictionary(Of String, List(Of ConnItem))(StringComparer.Ordinal)
-            For Each it In items
-                Dim key = CellKey(it.P, cellSizeFt)
-                Dim list As List(Of ConnItem) = Nothing
-                If Not dict.TryGetValue(key, list) Then
-                    list = New List(Of ConnItem)()
-                    dict(key) = list
-                End If
-                list.Add(it)
-            Next
-            Return dict
-        End Function
+        Private Shared Function CollectElementsWithConnectors(doc As Document) As List(Of Element)
+            Dim elems As New List(Of Element)()
 
-        Private Shared Function CellKey(p As XYZ, s As Double) As String
-            Dim ix As Long = CLng(Math.Floor(p.X / s))
-            Dim iy As Long = CLng(Math.Floor(p.Y / s))
-            Dim iz As Long = CLng(Math.Floor(p.Z / s))
-            Return ix.ToString() & "," & iy.ToString() & "," & iz.ToString()
-        End Function
-
-        Private Shared Iterator Function GetNeighborCandidates(buckets As Dictionary(Of String, List(Of ConnItem)), it As ConnItem, s As Double) As IEnumerable(Of ConnItem)
-            Dim ix As Long = CLng(Math.Floor(it.P.X / s))
-            Dim iy As Long = CLng(Math.Floor(it.P.Y / s))
-            Dim iz As Long = CLng(Math.Floor(it.P.Z / s))
-            For dx = -1 To 1
-                For dy = -1 To 1
-                    For dz = -1 To 1
-                        Dim key = (ix + dx).ToString() & "," & (iy + dy).ToString() & "," & (iz + dz).ToString()
-                        Dim list As List(Of ConnItem) = Nothing
-                        If buckets.TryGetValue(key, list) Then
-                            For Each cand In list
-                                If cand IsNot it Then Yield cand
-                            Next
-                        End If
-                    Next
-                Next
-            Next
-        End Function
-
-        Private Shared Function CollectAllConnectors(doc As Document) As List(Of ConnItem)
-            Dim list As New List(Of ConnItem)()
-            Dim idx As Integer = 0
-            Dim mep As Integer = 0, fam As Integer = 0
-
-            Try
-                For Each e In New FilteredElementCollector(doc).OfClass(GetType(MEPCurve)).WhereElementIsNotElementType().ToElements()
-                    Dim cm = TryGetConnectorManager(e)
-                    If cm Is Nothing Then Continue For
-                    idx = 0
-                    For Each o In cm.Connectors
-                        Dim c As Connector = TryCast(o, Connector)
-                        If c Is Nothing OrElse c.Origin Is Nothing Then Continue For
-                        list.Add(New ConnItem With {.Owner = e, .OwnerId = e.Id.IntegerValue, .Conn = c, .P = c.Origin, .IndexHint = idx})
-                        idx += 1 : mep += 1
-                    Next
-                Next
-
-                For Each e In New FilteredElementCollector(doc).OfClass(GetType(FamilyInstance)).WhereElementIsNotElementType().ToElements()
-                    Dim cm = TryGetConnectorManager(e)
-                    If cm Is Nothing Then Continue For
-                    idx = 0
-                    For Each o In cm.Connectors
-                        Dim c As Connector = TryCast(o, Connector)
-                        If c Is Nothing OrElse c.Origin Is Nothing Then Continue For
-                        list.Add(New ConnItem With {.Owner = e, .OwnerId = e.Id.IntegerValue, .Conn = c, .P = c.Origin, .IndexHint = idx})
-                        idx += 1 : fam += 1
-                    Next
-                Next
-            Catch
-            End Try
-
-            Log($"수집 카운트: MEPCurve={mep}, FamilyInstance={fam}")
-            Return list
-        End Function
-
-        Private Shared Function TryGetConnectorManager(e As Element) As ConnectorManager
-            Try
-                If TypeOf e Is MEPCurve Then Return DirectCast(e, MEPCurve).ConnectorManager
-                Dim fi = TryCast(e, FamilyInstance)
-                If fi IsNot Nothing AndAlso fi.MEPModel IsNot Nothing Then Return fi.MEPModel.ConnectorManager
-            Catch
-            End Try
-            Return Nothing
-        End Function
-
-        Private Shared Function IsConnectedTo(a As Connector, b As Connector) As Boolean
-            Try
-                If a Is Nothing OrElse b Is Nothing Then Return False
-                If a.IsConnected AndAlso b.IsConnected Then
-                    Dim refs = a.AllRefs
-                    If refs IsNot Nothing AndAlso refs.Size > 0 Then
-                        For Each ro In refs
-                            Dim rc As Connector = TryCast(ro, Connector)
-                            If rc Is Nothing Then Continue For
-                            If rc Is b Then Return True
-                            If rc.Owner IsNot Nothing AndAlso b.Owner IsNot Nothing AndAlso rc.Owner.Id.IntegerValue = b.Owner.Id.IntegerValue Then
-                                Return True
-                            End If
-                        Next
+            For Each fi As FamilyInstance In New FilteredElementCollector(doc).OfClass(GetType(FamilyInstance))
+                Try
+                    If fi.MEPModel IsNot Nothing AndAlso fi.MEPModel.ConnectorManager IsNot Nothing AndAlso fi.MEPModel.ConnectorManager.Connectors IsNot Nothing AndAlso fi.MEPModel.ConnectorManager.Connectors.Cast(Of Connector)().Any() Then
+                        elems.Add(fi)
                     End If
+                Catch
+                End Try
+            Next
+
+            Dim cats = New BuiltInCategory() {
+                BuiltInCategory.OST_PipeCurves, BuiltInCategory.OST_DuctCurves, BuiltInCategory.OST_CableTray, BuiltInCategory.OST_Conduit,
+                BuiltInCategory.OST_PipeFitting, BuiltInCategory.OST_DuctFitting, BuiltInCategory.OST_CableTrayFitting, BuiltInCategory.OST_ConduitFitting,
+                BuiltInCategory.OST_PipeAccessory, BuiltInCategory.OST_DuctAccessory
+            }
+
+            For Each cat In cats
+                For Each el As Element In New FilteredElementCollector(doc).OfCategory(cat).WhereElementIsNotElementType()
+                    If HasConnectors(el) Then elems.Add(el)
+                Next
+            Next
+
+            Return elems.Distinct().ToList()
+        End Function
+
+        Private Shared Function HasConnectors(el As Element) As Boolean
+            Try
+                Dim fi = TryCast(el, FamilyInstance)
+                If fi?.MEPModel IsNot Nothing AndAlso fi.MEPModel.ConnectorManager?.Connectors Is Not Nothing Then
+                    Return fi.MEPModel.ConnectorManager.Connectors.Cast(Of Connector)().Any()
+                End If
+
+                Dim mc = TryCast(el, MEPCurve)
+                If mc?.ConnectorManager?.Connectors Is Not Nothing Then
+                    Return mc.ConnectorManager.Connectors.Cast(Of Connector)().Any()
                 End If
             Catch
             End Try
             Return False
         End Function
 
+        Private Shared Function GetConnectors(el As Element) As List(Of Connector)
+            Try
+                Dim fi = TryCast(el, FamilyInstance)
+                If fi?.MEPModel IsNot Nothing AndAlso fi.MEPModel.ConnectorManager Is Not Nothing Then
+                    Return fi.MEPModel.ConnectorManager.Connectors.Cast(Of Connector)().ToList()
+                End If
+
+                Dim mc = TryCast(el, MEPCurve)
+                If mc?.ConnectorManager Is Not Nothing Then
+                    Return mc.ConnectorManager.Connectors.Cast(Of Connector)().ToList()
+                End If
+            Catch
+            End Try
+            Return New List(Of Connector)()
+        End Function
+
         Private Shared Function GetFamilyName(e As Element) As String
             Try
                 If TypeOf e Is FamilyInstance Then
                     Dim fi = DirectCast(e, FamilyInstance)
-                    If fi.Symbol IsNot Nothing AndAlso fi.Symbol.Family IsNot Nothing Then
+                    If fi.Symbol IsNot Nothing AndAlso fi.Symbol.Family Is Not Nothing Then
                         Return fi.Symbol.Family.Name
                     End If
                 Else
@@ -305,30 +257,37 @@ Namespace Services
             Return ""
         End Function
 
-        Private Shared Function ReadParamAsString(e As Element, paramName As String) As String
-            If String.IsNullOrWhiteSpace(paramName) Then Return ""
-            Try
-                Dim p As Parameter = e.LookupParameter(paramName)
-                If p Is Nothing Then
-                    For Each pp As Parameter In e.Parameters
-                        If String.Equals(pp.Definition.Name, paramName, StringComparison.OrdinalIgnoreCase) Then
-                            p = pp : Exit For
-                        End If
-                    Next
-                End If
-                If p Is Nothing Then Return ""
-                If p.StorageType = StorageType.String Then
+        Private Shared Function GetParamValue(el As Element, name As String) As String
+            If el Is Nothing OrElse String.IsNullOrWhiteSpace(name) Then Return "N/A"
+            Dim p = el.LookupParameter(name)
+            If p Is Nothing OrElse Not p.HasValue Then Return "N/A"
+
+            Select Case p.StorageType
+                Case StorageType.[String]
                     Return p.AsString()
-                Else
+                Case StorageType.Double
+                    Return p.AsDouble().ToString()
+                Case StorageType.Integer
+                    Return p.AsInteger().ToString()
+                Case Else
                     Return p.AsValueString()
-                End If
-            Catch
-            End Try
-            Return ""
+            End Select
         End Function
 
-        Private Shared Function FormatNumber(v As Double) As String
-            Return Math.Round(v, 4, MidpointRounding.AwayFromZero).ToString("0.####")
+        Private Shared Function BuildGrid(items As List(Of Tuple(Of Integer, XYZ, Connector))) As Dictionary(Of Tuple(Of Integer, Integer, Integer), List(Of Tuple(Of Integer, XYZ, Connector)))
+            Dim grid As New Dictionary(Of Tuple(Of Integer, Integer, Integer), List(Of Tuple(Of Integer, XYZ, Connector)))()
+            For Each tup In items
+                Dim key = BucketKey(tup.Item2)
+                If Not grid.ContainsKey(key) Then
+                    grid(key) = New List(Of Tuple(Of Integer, XYZ, Connector))()
+                End If
+                grid(key).Add(tup)
+            Next
+            Return grid
+        End Function
+
+        Private Shared Function BucketKey(p As XYZ) As Tuple(Of Integer, Integer, Integer)
+            Return Tuple.Create(CInt(Math.Floor(p.X)), CInt(Math.Floor(p.Y)), CInt(Math.Floor(p.Z)))
         End Function
 
         Private Shared Function ToDouble(o As Object) As Double
